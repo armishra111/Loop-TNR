@@ -123,6 +123,75 @@ def gradient_loss_norm():
     else:
         raise ValueError('No consistent module index matching')
 
+def build_loss_tensors(Q_dict):
+    if not consistent_nonuples:
+        raise ValueError("No consistent module index matching")
+
+    U_tensor = {}
+    V_tensor = {}
+    shape_1 = (chi,) * 8 #eight indices
+
+    for (A, B, C, D, E, F, G, H, I) in consistent_nonuples:
+
+        key_1 = (A, B, C, D, F, G, H, I)
+        #print(key)
+        U_tensor[key_1] = np.zeros(shape_1, dtype=np.complex128)
+        V_tensor[key_1] = np.zeros(shape_1, dtype=np.complex128)
+        
+
+        U_tensor[key_1] += oe.contract('i l u x, m n u v, p q v w, s t x w -> i l m n q p s t',
+                                    X[A, B, D, E] , Y[B, C, E, F], Z[E, F, H, I], W[D, E, G, H]
+                                    )
+
+        V_tensor[key_1] += oe.contract('l t u x, i m u v, n p v w , s q x w -> i l m n q p s t',
+                                    P[A, D, E, G], Q[B, A, C, E], R[C, E, F, I], S[E, G, I, H]
+                                    ) # indices matches ipad
+
+    return U_tensor, V_tensor
+
+
+def build_grad_tensors(Q_dict):
+    if not consistent_nonuples:
+        raise ValueError("No consistent module index matching")
+
+    K_tensor = {} # This capures the tensor of the form x^7
+    L_tensor = {} # This captures the tensor of the form x^3*y^4
+    shape_2 = (chi,) * 4 #four indices
+
+    for (A, B, C, D, E, F, G, H, I) in consistent_nonuples:
+
+        key_2 = (B, A, C, E)
+        #print(key)
+        K_tensor[key_2] = np.zeros(shape_2, dtype=np.complex128)
+        L_tensor[key_2] = np.zeros(shape_2, dtype=np.complex128)
+
+        K_tensor[key_2] += oe.contract('l t x u, n p v w, s q w x, l t a b, i m b c, n p c d, s q d a -> i m u v',# consistent with ipad diagram; the tensor matches module and tensor indices of Q
+                                    P[A, D, E, G], R[C, E, F, I], S[E, G, I, H],
+                                    P[A, D, E, G].conj(), Q_1[B, A, C, E].conj(), R[C, E, F, I].conj(), S[E, G, I, H].conj(),
+                                    )
+
+        L_tensor[key_2] += oe.contract('l t x u, n p v w, s q w x, i l x u, m n u v, p q v w, s t w x -> i m u v', # consistent with ipad diagram
+                                    P[A, D, E, G], R[C, E, F, I], S[E, G, I, H],
+                                    X[A, B, D, E].conj(), Y[B, C, E, F].conj(), Z[E, F, H, I].conj(), W[D, E, G, H].conj()
+                                    )
+    return K_tensor, L_tensor
+
+
+def loss_and_grad(Q_override=None):
+    Q_dict = Q if Q_override is None else Q_override
+
+    U_tensor, V_tensor = build_loss_tensors(Q_dict)
+    loss_terms = dict_diff(U_tensor, V_tensor)
+    if loss_terms is None:
+        raise ValueError("Loss tensors have incompatible keys")
+    loss = 0.5 * dict_norm(loss_terms) ** 2
+
+    K_tensor, L_tensor = build_grad_tensors(Q_dict)
+    grad_terms = dict_diff(K_tensor, L_tensor)
+    if grad_terms is None:
+        raise ValueError("Gradient tensors have incompatible keys")
+
+    return loss, grad_terms
 
 chi = 4
 d = 2
