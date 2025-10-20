@@ -1,4 +1,3 @@
-from typing import Literal
 import numpy as np
 import random
 from itertools import product
@@ -57,8 +56,6 @@ def get_allowed_nonuples(allowed_pairs, vertical_allowed_pairs, modules):
                 Is = [I for I in modules if (H, I) in allowed_set and (F, I) in vertical_set]
                 for I in Is:
                     allowed_nonuple.add((A, B, C, D, E, F, G, H, I))
-
-
     return allowed_nonuple
 
 
@@ -73,11 +70,11 @@ def is_nonaple_consistent_with_quadruples(allowed_quadruples, A, B, C, D, E, F, 
         return False
     if (A, D, E, G) not in allowed_quadruples: # P
         return False
-    if (A, B, C, E) not in allowed_quadruples: # Q
+    if (B, A, C, E) not in allowed_quadruples: # Q
         return False
-    if (C, F, I, E) not in allowed_quadruples: # R
+    if (C, E, F, I) not in allowed_quadruples: # R
         return False
-    if (I, H, G, E) not in allowed_quadruples: # S
+    if (E, G, I, H) not in allowed_quadruples: # S
         return False
     return True
 
@@ -89,11 +86,18 @@ def dict_diff(d1, d2):  #function to make difference of two tensors with module 
         diff[k1] = v1 - d2[k1]
     return diff
 
-def dict_norm(d): #function to make norm for tensors with module index/dictionary
+def dict_squared_norm(d): #function to find 1/2* L_2 norm for tensors with module index/dictionary
+    squared_norm = 0
+    for v in d.values():
+        squared_norm += np.linalg.norm(v)**2
+    return 0.5 * squared_norm
+
+def dict_norm(d): #function to find 1/2* L_2 norm for tensors with module index/dictionary
     norm = 0
     for v in d.values():
         norm += np.linalg.norm(v)
     return norm
+
 
 def loss_function():
     if consistent_nonuples:
@@ -103,7 +107,19 @@ def loss_function():
     
 def loss_function_norm():
     if consistent_nonuples:
-        return 0.5*(dict_norm(loss_function()))**2
+        return dict_squared_norm(loss_function())
+    else:
+        raise ValueError('No consistent module index matching')
+
+def gradient_loss_function():
+    if consistent_nonuples:
+        return dict_diff(K_tensor, L_tensor) # This has module index = B C A E and tensor index = i m u v
+    else:
+        raise ValueError('No consistent module index matching')
+
+def gradient_loss_norm():
+    if consistent_nonuples:
+        return dict_norm(gradient_loss_function())
     else:
         raise ValueError('No consistent module index matching')
 
@@ -135,45 +151,49 @@ consistent_nonuples = [
 
 
 X = {}
-for (A, B, E, D) in allowed_quadruples:
-    X[A, B, E, D] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+for (A, B, D, E) in allowed_quadruples:
+    X[A, B, D, E] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
 
 Y = {}
-for (B, C, F, E) in allowed_quadruples:
-    Y[B, C, F, E] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+for (B, C, E, F) in allowed_quadruples:
+    Y[B, C, E, F] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
 
 Z = {}
-for (E, F, I , H) in allowed_quadruples:
-    Z[E, F, I , H] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+for (E, F, H , I) in allowed_quadruples:
+    Z[E, F, H , I] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
 
 W = {} 
-for (D, E, H, G) in allowed_quadruples:
-    W[D, E, H, G] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+for (D, E, G, H) in allowed_quadruples:
+    W[D, E, G, H] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
 
 P = {}
-for (A, D, G, E) in allowed_quadruples:
-    P[A, D, G, E] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+for (A, D, E, G) in allowed_quadruples:
+    P[A, D, E, G] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
 
 Q = {}
-for (A, B, E, C) in allowed_quadruples:
-    Q[A, B, E, C] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+for (B, A, C, E) in allowed_quadruples:
+    Q[B, A, C, E] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+
+Q_1 = {}
+for (B, A, C, E) in allowed_quadruples:
+    Q_1[B, A, C, E] = Q[B, A, C, E].copy()
 
 R = {}
 for (C, E, F, I) in allowed_quadruples:
     R[C, E, F, I] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
 
 S = {}
-for (G, E, H, I) in allowed_quadruples:
-    S[G, E, H, I] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+for (E, G, I, H) in allowed_quadruples:
+    S[E, G, I, H] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
 
 U_tensor = {}
 V_tensor = {}
+shape_1 = (chi,) * 8 #eight indices
 
 for (A, B, C, D, E, F, G, H, I) in consistent_nonuples:
 
     key_1 = (A, B, C, D, F, G, H, I)
     #print(key)
-    shape_1 = (chi,) * 8 #eight indices
     U_tensor[key_1] = np.zeros(shape_1, dtype=np.complex128)
     V_tensor[key_1] = np.zeros(shape_1, dtype=np.complex128)
     
@@ -183,42 +203,29 @@ for (A, B, C, D, E, F, G, H, I) in consistent_nonuples:
                                 )
 
     V_tensor[key_1] += oe.contract('l t u x, i m u v, n p v w , s q x w -> i l m n q p s t',
-                                P[D, E, G, H], Q[A, B, D, E], R[B, C, E, F], S[E, F, H, I]
+                                P[A, D, E, G], Q[B, A, C, E], R[C, E, F, I], S[E, G, I, H]
                                 ) # indices matches ipad
 
 K_tensor = {} # This capures the tensor of the form x^7
 L_tensor = {} # This captures the tensor of the form x^3*y^4
+shape_2 = (chi,) * 4 #four indices
 
 for (A, B, C, D, E, F, G, H, I) in consistent_nonuples:
 
-    key_2 = (B, C, A, E)
+    key_2 = (B, A, C, E)
     #print(key)
-
-    shape_2 = (chi,) * 4 #four indices
     K_tensor[key_2] = np.zeros(shape_2, dtype=np.complex128)
     L_tensor[key_2] = np.zeros(shape_2, dtype=np.complex128)
 
-    K_tensor[key_2] += oe.contract('l t x u, i m u v, n p v w, s q w x, l t x u, n p v w, s q w x -> i m u v',# consistent with ipad diagram; the tensor matches module and tensor indices of Q
-                                P[A, D, G, E] , Q[A, B, E, C], R[C, E, F, I], S[G, E, H, I],
-                                P[A, D, G, E], R[C, E, F, I], S[G, E, H, I]
+    K_tensor[key_2] += oe.contract('l t x u, n p v w, s q w x, l t a b, i m b c, n p c d, s q d a -> i m u v',# consistent with ipad diagram; the tensor matches module and tensor indices of Q
+                                P[A, D, E, G], R[C, E, F, I], S[E, G, I, H],
+                                P[A, D, E, G].conj(), Q_1[B, A, C, E].conj(), R[C, E, F, I].conj(), S[E, G, I, H].conj(),
                                 )
 
-    L_tensor[key_2] += oe.contract('i l x u, m n u v, p q v w, s t w x, l t x u, n p v w, s q w x -> i m u v', # consistent with ipad diagram
-                                X[A, B, C, I], Y[B, C, F, E], Z[E, F, I , H], W[D, E, H, G],
-                                P[A, D, G, E], R[C, E, F, I], S[G, E, H, I]
+    L_tensor[key_2] += oe.contract('l t x u, n p v w, s q w x, i l x u, m n u v, p q v w, s t w x -> i m u v', # consistent with ipad diagram
+                                P[A, D, E, G], R[C, E, F, I], S[E, G, I, H],
+                                X[A, B, D, E].conj(), Y[B, C, E, F].conj(), Z[E, F, H, I].conj(), W[D, E, G, H].conj()
                                 )
-    
-def gradient_loss_function():
-    if consistent_nonuples:
-        return dict_diff(K_tensor, L_tensor) # This has module index = B C A E and tensor index = i m u v
-    else:
-        raise ValueError('No consistent module index matching')
-
-def gradient_loss_norm():
-    if consistent_nonuples:
-        return dict_norm(gradient_loss_function())
-    else:
-        raise ValueError('No consistent module index matching')
 
 def main():
         return print(f"loss function is {loss_function_norm()} and gradient_norm is {gradient_loss_norm()}")
