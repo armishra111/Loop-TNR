@@ -1,303 +1,313 @@
+"""
+Loop-TNR loss function, gradient, and L-BFGS optimiser.
+
+The loss is eps^2 = 0.5 * ||U(X,Y,Z,W) - V(P,Q,R,S)||_F^2 where
+  U = pre-RG-step primal contraction (target, frozen during optimisation)
+  V = dual projector contraction (the approximation, varied)
+
+The optimiser adjusts the dual projectors P,Q,R,S to minimise eps^2,
+i.e. to make V match U as closely as possible. X,Y,Z,W are never
+modified — they come from the previous RG layer.
+
+All state is passed explicitly — no module-level globals.
+"""
 import numpy as np
-import random
-from itertools import product
 import opt_einsum as oe
 
-def get_allowed_quadruples(allowed_pairs, vertical_allowed_pairs):
-    vertical = set(vertical_allowed_pairs)
-    if not vertical or not allowed_pairs:
-        return set()
-
-    allowed_quadruples = set()
-    for (A, B) in allowed_pairs:
-        for (D, E) in allowed_pairs:
-            if (A, D) in vertical and (B, E) in vertical:
-                allowed_quadruples.add((A, B, D, E))
-
-    return allowed_quadruples
-
-# def get_allowed_nonuples(allowed_pairs, vertical_allowed_pairs, modules):
-    
-#     allowed_nonuple = set()
-#     allowed_set = set(allowed_pairs)
-#     vertical_set = set(vertical_allowed_pairs)     
-
-#     for (A, B), (D, E), (G, H) in product(allowed_set, repeat = 3):
-#         for (C, F, I) in product(modules, repeat = 3):
-
-#             horizontal_pairs = [(A, B), (B, C), (D, E), (E, F), (G, H), (H, I)]
-#             if any(pair not in allowed_set for pair in horizontal_pairs):
-#                 continue
-
-#             verticle_pairs = [(A, D), (D, G), (B, E), (E, H), (C, F), (F, I)]
-#             if any(pair not in vertical_set for pair in verticle_pairs):
-#                 continue
-
-#             allowed_nonuple.add((A, B, C, D, E, F, G, H, I))
-
-#     return allowed_nonuple
-
-def get_allowed_nonuples(allowed_pairs, vertical_allowed_pairs, modules):
-    
-    allowed_nonuple = set()
-    allowed_set = set(allowed_pairs)
-    vertical_set = set(vertical_allowed_pairs)     
-
-    for (A, B), (D, E), (G, H) in product(allowed_set, repeat = 3):
-        if (A, D) not in vertical_set or (D, G) not in vertical_set:
-            continue
-        if (B, E) not in vertical_set or (E, H) not in vertical_set:
-            continue
-
-        Cs = [C for C in modules if (B, C) in allowed_set]
-        for C in Cs:
-            Fs = [F for F in modules if (E, F) in allowed_set and (C, F) in vertical_set]
-            for F in Fs:
-                Is = [I for I in modules if (H, I) in allowed_set and (F, I) in vertical_set]
-                for I in Is:
-                    allowed_nonuple.add((A, B, C, D, E, F, G, H, I))
-    return allowed_nonuple
+from potts_q5_hamiltonian import build_q5_potts
+from scipy.optimize import minimize as scipy_minimize
+from utils import (dict_diff, dict_squared_norm, dict_frobenius_norm,
+                   dict_to_vec, vec_to_dict)
 
 
-def is_nonaple_consistent_with_quadruples(allowed_quadruples, A, B, C, D, E, F, G, H, I):
-    if (A, B, D, E) not in allowed_quadruples: # X
-        return False
-    if (B, C, E, F) not in allowed_quadruples: # Y
-        return False
-    if (D, E, G, H) not in allowed_quadruples: # W
-        return False
-    if (E, F, H, I) not in allowed_quadruples: # Z
-        return False
-    if (A, D, E, G) not in allowed_quadruples: # P
-        return False
-    if (B, A, C, E) not in allowed_quadruples: # Q
-        return False
-    if (C, E, F, I) not in allowed_quadruples: # R
-        return False
-    if (E, G, I, H) not in allowed_quadruples: # S
-        return False
-    return True
+# =====================================================================
+# Constants
+# =====================================================================
 
-def dict_diff(d1, d2):  #function to make difference of two tensors with module index (dictionary)
-    if d1.keys() != d2.keys():
-        return None
-    diff = {}
-    for k1, v1 in d1.items():
-        diff[k1] = v1 - d2[k1]
-    return diff
+DUAL_NAMES = ('P', 'Q', 'R', 'S')
 
-def dict_squared_norm(d): #function to find 1/2* L_2 norm for tensors with module index/dictionary
-    squared_norm = 0
-    for v in d.values():
-        squared_norm += np.linalg.norm(v)**2
-    return 0.5 * squared_norm
+# State-dict key for each tensor (Q is stored as 'Q_tens' to avoid
+# shadowing Python's built-in Q).
+STATE_KEY = {'X': 'X', 'Y': 'Y', 'Z': 'Z', 'W': 'W',
+             'P': 'P', 'Q': 'Q_tens', 'R': 'R', 'S': 'S'}
 
-def dict_norm(d): #function to find 1/2* L_2 norm for tensors with module index/dictionary
-    norm = 0
-    for v in d.values():
-        norm += np.linalg.norm(v)
-    return norm
+# Einsum strings (consistent with iPad diagram)
+U_EINSUM = 'i l u x, m n u v, p q v w, s t x w -> i l m n q p s t'
+V_EINSUM = 'l t u x, i m u v, n p v w, s q x w -> i l m n q p s t'
 
 
-def loss_function():
-    if consistent_nonuples:
-        return dict_diff(U_tensor, V_tensor) # x^4 - y^4
-    else:
-        raise ValueError('No consistent module index matching')
-    
-def loss_function_norm():
-    if consistent_nonuples:
-        return dict_squared_norm(loss_function())
-    else:
-        raise ValueError('No consistent module index matching')
+# =====================================================================
+# Core tensor assembly
+# =====================================================================
 
-def gradient_loss_function():
-    if consistent_nonuples:
-        return dict_diff(K_tensor, L_tensor) # This has module index = B C A E and tensor index = i m u v
-    else:
-        raise ValueError('No consistent module index matching')
-
-def gradient_loss_norm():
-    if consistent_nonuples:
-        return dict_norm(gradient_loss_function())
-    else:
-        raise ValueError('No consistent module index matching')
-
-def build_loss_tensors(Q_dict):
-    if not consistent_nonuples:
-        raise ValueError("No consistent module index matching")
-
+def build_loss_tensors(chi, consistent_nonuples, X, Y, Z, W, P, Q, R, S):
+    """Assemble U (primal) and V (dual) 8-index loss tensors."""
     U_tensor = {}
     V_tensor = {}
-    shape_1 = (chi,) * 8 #eight indices
+    shape = (chi,) * 8
 
-    for (A, B, C, D, E, F, G, H, I) in consistent_nonuples:
+    for nonu in consistent_nonuples:
+        A, B, C, D, E, F, G, H, I = nonu
+        key = (A, B, C, D, F, G, H, I)
+        if key not in U_tensor:
+            U_tensor[key] = np.zeros(shape, dtype=np.complex128)
+            V_tensor[key] = np.zeros(shape, dtype=np.complex128)
 
-        key_1 = (A, B, C, D, F, G, H, I)
-        #print(key)
-        U_tensor[key_1] = np.zeros(shape_1, dtype=np.complex128)
-        V_tensor[key_1] = np.zeros(shape_1, dtype=np.complex128)
-        
-
-        U_tensor[key_1] += oe.contract('i l u x, m n u v, p q v w, s t x w -> i l m n q p s t',
-                                    X[A, B, D, E] , Y[B, C, E, F], Z[E, F, H, I], W[D, E, G, H]
-                                    )
-
-        V_tensor[key_1] += oe.contract('l t u x, i m u v, n p v w , s q x w -> i l m n q p s t',
-                                    P[A, D, E, G], Q[B, A, C, E], R[C, E, F, I], S[E, G, I, H]
-                                    ) # indices matches ipad
+        U_tensor[key] += oe.contract(U_EINSUM,
+            X[A,B,D,E], Y[B,C,E,F], Z[E,F,H,I], W[D,E,G,H])
+        V_tensor[key] += oe.contract(V_EINSUM,
+            P[A,D,E,G], Q[B,A,C,E], R[C,E,F,I], S[E,G,I,H])
 
     return U_tensor, V_tensor
 
 
-def build_grad_tensors(Q_dict):
-    if not consistent_nonuples:
-        raise ValueError("No consistent module index matching")
+# =====================================================================
+# Gradient computation (any subset of 8 tensors)
+# =====================================================================
 
-    K_tensor = {} # This capures the tensor of the form x^7
-    L_tensor = {} # This captures the tensor of the form x^3*y^4
-    shape_2 = (chi,) * 4 #four indices
+def build_grads(chi, consistent_nonuples, diff_tensor,
+                P, Q, R, S, which='PQRS'):
+    """Compute ∂(eps²)/∂T for each dual projector T named in `which`.
 
-    for (A, B, C, D, E, F, G, H, I) in consistent_nonuples:
+    eps² = 0.5 * ||U - V||_F^2.  U is frozen (target); only the dual
+    side V(P,Q,R,S) is differentiated.
 
-        key_2 = (B, A, C, E)
-        #print(key)
-        K_tensor[key_2] = np.zeros(shape_2, dtype=np.complex128)
-        L_tensor[key_2] = np.zeros(shape_2, dtype=np.complex128)
+    For dual tensors: grad_T = -conj(diff) contracted with the 3
+    remaining V-side tensors (Q removed for ∂/∂Q, etc.).
 
-        K_tensor[key_2] += oe.contract('l t x u, n p v w, s q w x, l t a b, i m b c, n p c d, s q d a -> i m u v',# consistent with ipad diagram; the tensor matches module and tensor indices of Q
-                                    P[A, D, E, G], R[C, E, F, I], S[E, G, I, H],
-                                    P[A, D, E, G].conj(), Q_1[B, A, C, E].conj(), R[C, E, F, I].conj(), S[E, G, I, H].conj(),
-                                    )
+    `which`: subset of 'PQRS'. Returns {name: grad_dict}.
 
-        L_tensor[key_2] += oe.contract('l t x u, n p v w, s q w x, i l x u, m n u v, p q v w, s t w x -> i m u v', # consistent with ipad diagram
-                                    P[A, D, E, G], R[C, E, F, I], S[E, G, I, H],
-                                    X[A, B, D, E].conj(), Y[B, C, E, F].conj(), Z[E, F, H, I].conj(), W[D, E, G, H].conj()
-                                    )
-    return K_tensor, L_tensor
+    # Primal gradients (∂L/∂X etc.) are not computed — X,Y,Z,W define
+    # the pre-RG target and are never optimised. If needed in future,
+    # the formula is +diff (not -conj(diff)) contracted with the 3
+    # remaining U-side tensors.
+    """
+    which_set = set(which.upper()) & set('PQRS')
+    grads = {name: {} for name in which_set}
+    shape4 = (chi,) * 4
+
+    for nonu in consistent_nonuples:
+        A, B, C, D, E, F, G, H, I = nonu
+        diff_key = (A, B, C, D, F, G, H, I)
+        if diff_key not in diff_tensor:
+            continue
+
+        Pv = P[A,D,E,G]; Qv = Q[B,A,C,E]; Rv = R[C,E,F,I]; Sv = S[E,G,I,H]
+        d_neg = -diff_tensor[diff_key].conj()
+
+        if 'P' in which_set:
+            k = (A,D,E,G)
+            if k not in grads['P']:
+                grads['P'][k] = np.zeros(shape4, dtype=np.complex128)
+            grads['P'][k] += oe.contract(
+                'i l m n q p s t, i m u v, n p v w, s q x w -> l t u x',
+                d_neg, Qv, Rv, Sv)
+
+        if 'Q' in which_set:
+            k = (B,A,C,E)
+            if k not in grads['Q']:
+                grads['Q'][k] = np.zeros(shape4, dtype=np.complex128)
+            grads['Q'][k] += oe.contract(
+                'i l m n q p s t, l t u x, n p v w, s q x w -> i m u v',
+                d_neg, Pv, Rv, Sv)
+
+        if 'R' in which_set:
+            k = (C,E,F,I)
+            if k not in grads['R']:
+                grads['R'][k] = np.zeros(shape4, dtype=np.complex128)
+            grads['R'][k] += oe.contract(
+                'i l m n q p s t, l t u x, i m u v, s q x w -> n p v w',
+                d_neg, Pv, Qv, Sv)
+
+        if 'S' in which_set:
+            k = (E,G,I,H)
+            if k not in grads['S']:
+                grads['S'][k] = np.zeros(shape4, dtype=np.complex128)
+            grads['S'][k] += oe.contract(
+                'i l m n q p s t, l t u x, i m u v, n p v w -> s q x w',
+                d_neg, Pv, Qv, Rv)
+
+    return grads
 
 
-def loss_and_grad(Q_override=None):
-    Q_dict = Q if Q_override is None else Q_override
+# =====================================================================
+# High-level loss + gradient
+# =====================================================================
 
-    U_tensor, V_tensor = build_loss_tensors(Q_dict)
-    loss_terms = dict_diff(U_tensor, V_tensor)
-    if loss_terms is None:
+def loss_and_grad(state, overrides=None, which='PQRS'):
+    """Compute (eps², grad_dicts) from a state dict.
+
+    eps² = 0.5 * ||U(X,Y,Z,W) - V(P,Q,R,S)||_F^2.
+    U is frozen (pre-RG target). Only dual projectors P,Q,R,S can be varied.
+
+    overrides: dict mapping dual tensor name -> replacement dict-tensor.
+               e.g. {'Q': Q_new} or {'P': P_new, 'Q': Q_new, 'R':..., 'S':...}
+    which: subset of 'PQRS' to compute gradients for.
+
+    Returns (loss_scalar, grads) where grads = {name: grad_dict_tensor}.
+    """
+    # Primal side: always from state (frozen)
+    X, Y, Z, W = state['X'], state['Y'], state['Z'], state['W']
+
+    # Dual side: apply overrides
+    dual = {}
+    for name in DUAL_NAMES:
+        sk = STATE_KEY[name]
+        if overrides and name in overrides:
+            dual[name] = overrides[name]
+        else:
+            dual[name] = state[sk]
+
+    U, V = build_loss_tensors(
+        state['chi'], state['consistent_nonuples'],
+        X, Y, Z, W, dual['P'], dual['Q'], dual['R'], dual['S'])
+
+    diff = dict_diff(U, V)
+    if diff is None:
         raise ValueError("Loss tensors have incompatible keys")
-    loss = 0.5 * dict_norm(loss_terms) ** 2
+    loss = dict_squared_norm(diff)
 
-    K_tensor, L_tensor = build_grad_tensors(Q_dict)
-    grad_terms = dict_diff(K_tensor, L_tensor)
-    if grad_terms is None:
-        raise ValueError("Gradient tensors have incompatible keys")
+    grads = build_grads(
+        state['chi'], state['consistent_nonuples'], diff,
+        dual['P'], dual['Q'], dual['R'], dual['S'],
+        which=which)
 
-    return loss, grad_terms
-
-chi = 4
-d = 2
-
-modules = [0, 1, 2, 3, 4, 5]
-num_allowed_pairs = 15
-num_vertical_allowed_pairs = 15
-
-pairs = [c for c in product(modules, repeat = 2)]
-# allowed_pairs = random.sample(pairs, num_allowed_pairs)
-# allowed_pairs = pairs
-# vertical_allowed_pairs = random.sample(pairs, num_vertical_allowed_pairs)
-# vertical_allowed_pairs = pairs
-
-pairs_1 = [c for c in product(modules, repeat = 2)]
-allowed_pairs_1: list[tuple[int, ...]] = random.sample(pairs_1, num_allowed_pairs)
-vertical_allowed_pairs_1 = random.sample(pairs_1, num_vertical_allowed_pairs)
-
-allowed_nonuples = get_allowed_nonuples(allowed_pairs_1, vertical_allowed_pairs_1, modules)
-allowed_quadruples = get_allowed_quadruples(allowed_pairs_1, vertical_allowed_pairs_1)
-consistent_nonuples = [
-        nonuples
-        for nonuples in allowed_nonuples
-        if is_nonaple_consistent_with_quadruples(allowed_quadruples, *nonuples)
-    ]
+    return loss, grads
 
 
-X = {}
-for (A, B, D, E) in allowed_quadruples:
-    X[A, B, D, E] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+# =====================================================================
+# Setup helper
+# =====================================================================
 
-Y = {}
-for (B, C, E, F) in allowed_quadruples:
-    Y[B, C, E, F] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+def setup_potts(Q_potts=5, verbose=True):
+    """Build the full Potts state dict at criticality."""
+    state = build_q5_potts(Q=Q_potts, verbose=verbose)
 
-Z = {}
-for (E, F, H , I) in allowed_quadruples:
-    Z[E, F, H , I] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+    state['U_tensor'], state['V_tensor'] = build_loss_tensors(
+        state['chi'], state['consistent_nonuples'],
+        state['X'], state['Y'], state['Z'], state['W'],
+        state['P'], state['Q_tens'], state['R'], state['S'])
 
-W = {} 
-for (D, E, G, H) in allowed_quadruples:
-    W[D, E, G, H] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+    state['diff_tensor'] = dict_diff(state['U_tensor'], state['V_tensor'])
+    return state
 
-P = {}
-for (A, D, E, G) in allowed_quadruples:
-    P[A, D, E, G] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
 
-Q = {}
-for (B, A, C, E) in allowed_quadruples:
-    Q[B, A, C, E] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+def compute_loss_from_state(state):
+    """0.5 * ||U - V||_F^2 from pre-built diff_tensor."""
+    return dict_squared_norm(state['diff_tensor'])
 
-Q_1 = {}
-for (B, A, C, E) in allowed_quadruples:
-    Q_1[B, A, C, E] = Q[B, A, C, E].copy()
 
-R = {}
-for (C, E, F, I) in allowed_quadruples:
-    R[C, E, F, I] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+# =====================================================================
+# L-BFGS optimiser (any subset of 8 tensors)
+# =====================================================================
 
-S = {}
-for (E, G, I, H) in allowed_quadruples:
-    S[E, G, I, H] = (np.random.randn(chi, chi, chi, chi) + 1j*np.random.randn(chi, chi, chi, chi)) / np.sqrt(2)
+def optimize(state, which='PQRS', method='L-BFGS-B', maxiter=200,
+             tol=1e-12, verbose=True):
+    """Optimise dual projectors to minimise eps^2 = 0.5*||U-V||_F^2.
 
-U_tensor = {}
-V_tensor = {}
-shape_1 = (chi,) * 8 #eight indices
+    U(X,Y,Z,W) is the pre-RG target (always frozen).
+    V(P,Q,R,S) is the dual approximation (varied).
 
-for (A, B, C, D, E, F, G, H, I) in consistent_nonuples:
+    which: subset of 'PQRS' to optimise. Default = all 4 dual projectors.
+           (X,Y,Z,W are never varied — they define the target U.)
 
-    key_1 = (A, B, C, D, F, G, H, I)
-    #print(key)
-    U_tensor[key_1] = np.zeros(shape_1, dtype=np.complex128)
-    V_tensor[key_1] = np.zeros(shape_1, dtype=np.complex128)
-    
+    # Historical note: Q-only optimisation converges to a local minimum
+    # (35.5% decrease) because P,R,S are frozen at wrong values.
+    # All 4 dual projectors needed to reach global zero (machine eps).
 
-    U_tensor[key_1] += oe.contract('i l u x, m n u v, p q v w, s t x w -> i l m n q p s t',
-                                X[A, B, D, E] , Y[B, C, E, F], Z[E, F, H, I], W[D, E, G, H]
-                                )
+    Returns (optimised_state, scipy.OptimizeResult).
+    """
+    which_upper = which.upper()
+    tensor_names = [c for c in which_upper if c in set('PQRS')]
+    if not tensor_names:
+        raise ValueError(f"which='{which}' must contain at least one of P,Q,R,S")
 
-    V_tensor[key_1] += oe.contract('l t u x, i m u v, n p v w , s q x w -> i l m n q p s t',
-                                P[A, D, E, G], Q[B, A, C, E], R[C, E, F, I], S[E, G, I, H]
-                                ) # indices matches ipad
+    # Build sorted keys and shapes for each varied tensor
+    sorted_keys = sorted(state['allowed_quadruples'])
+    meta = {}  # name -> (shapes, vec_len)
+    total_len = 0
+    for name in tensor_names:
+        sk = STATE_KEY[name]
+        shapes = [state[sk][k].shape for k in sorted_keys]
+        vec_len = sum(2 * int(np.prod(s)) for s in shapes)  # Re+Im
+        meta[name] = (shapes, vec_len)
+        total_len += vec_len
 
-K_tensor = {} # This capures the tensor of the form x^7
-L_tensor = {} # This captures the tensor of the form x^3*y^4
-shape_2 = (chi,) * 4 #four indices
+    def pack(overrides):
+        parts = []
+        for name in tensor_names:
+            parts.append(dict_to_vec(overrides[name], sorted_keys))
+        return np.concatenate(parts)
 
-for (A, B, C, D, E, F, G, H, I) in consistent_nonuples:
+    def unpack(x):
+        overrides = {}
+        i = 0
+        for name in tensor_names:
+            shapes, vlen = meta[name]
+            overrides[name] = vec_to_dict(x[i:i+vlen], sorted_keys, shapes)
+            i += vlen
+        return overrides
 
-    key_2 = (B, A, C, E)
-    #print(key)
-    K_tensor[key_2] = np.zeros(shape_2, dtype=np.complex128)
-    L_tensor[key_2] = np.zeros(shape_2, dtype=np.complex128)
+    # Initial vector
+    x0 = pack({name: state[STATE_KEY[name]] for name in tensor_names})
+    call_count = [0]
 
-    K_tensor[key_2] += oe.contract('l t x u, n p v w, s q w x, l t a b, i m b c, n p c d, s q d a -> i m u v',# consistent with ipad diagram; the tensor matches module and tensor indices of Q
-                                P[A, D, E, G], R[C, E, F, I], S[E, G, I, H],
-                                P[A, D, E, G].conj(), Q_1[B, A, C, E].conj(), R[C, E, F, I].conj(), S[E, G, I, H].conj(),
-                                )
+    def objective(x):
+        overrides = unpack(x)
+        loss, grads = loss_and_grad(state, overrides=overrides, which=which_upper)
+        grad_parts = []
+        for name in tensor_names:
+            grad_parts.append(dict_to_vec(grads[name], sorted_keys))
+        grad_vec = np.concatenate(grad_parts)
+        # TODO: negate Im(grad) for complex β — moot for real Potts
+        call_count[0] += 1
+        if verbose and call_count[0] % 10 == 1:
+            print(f"  eval {call_count[0]:4d}: loss = {loss:.6e}")
+        return float(loss), grad_vec.astype(np.float64)
 
-    L_tensor[key_2] += oe.contract('l t x u, n p v w, s q w x, i l x u, m n u v, p q v w, s t w x -> i m u v', # consistent with ipad diagram
-                                P[A, D, E, G], R[C, E, F, I], S[E, G, I, H],
-                                X[A, B, D, E].conj(), Y[B, C, E, F].conj(), Z[E, F, H, I].conj(), W[D, E, G, H].conj()
-                                )
+    if verbose:
+        init_loss = compute_loss_from_state(state)
+        print(f"  optimising: {', '.join(tensor_names)}")
+        print(f"  x0 dim = {total_len}, initial loss = {init_loss:.6e}")
 
-def main():
-        return print(f"loss function is {loss_function_norm()} and gradient_norm is {gradient_loss_norm()}")
+    result = scipy_minimize(objective, x0, method=method, jac=True,
+                            options={'maxiter': maxiter, 'disp': verbose,
+                                     'ftol': tol, 'gtol': 1e-10})
+
+    # Rebuild state at optimum
+    opt_overrides = unpack(result.x)
+    opt_state = dict(state)
+    for name in tensor_names:
+        opt_state[STATE_KEY[name]] = opt_overrides[name]
+
+    U, V = build_loss_tensors(
+        state['chi'], state['consistent_nonuples'],
+        opt_state['X'], opt_state['Y'], opt_state['Z'], opt_state['W'],
+        opt_state['P'], opt_state['Q_tens'], opt_state['R'], opt_state['S'])
+    opt_state['U_tensor'] = U
+    opt_state['V_tensor'] = V
+    opt_state['diff_tensor'] = dict_diff(U, V)
+
+    return opt_state, result
+
+
+# =====================================================================
+# CLI entry point
+# =====================================================================
+
+def main(Q_potts=2):
+    state = setup_potts(Q_potts=Q_potts, verbose=True)
+    loss = compute_loss_from_state(state)
+    print(f"\nQ={Q_potts} Potts, chi={state['chi']}, "
+          f"{len(state['consistent_nonuples'])} nonuples.")
+    print(f"Initial eps^2 = ||U(X,Y,Z,W) - V(P,Q,R,S)||_F^2 = {loss:.6e}")
+
+    print("\n=== L-BFGS: optimise V(P,Q,R,S) to match U(X,Y,Z,W) ===")
+    opt, res = optimize(state, which='PQRS', maxiter=300, verbose=True)
+    fl = compute_loss_from_state(opt)
+    print(f"\n  Converged: {res.success}, iters: {res.nit}, evals: {res.nfev}")
+    print(f"  Final eps^2: {fl:.6e} ({(1-fl/loss)*100:.1f}% decrease)")
+
 
 if __name__ == "__main__":
     main()
